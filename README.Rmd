@@ -1,0 +1,723 @@
+---
+title: "Nonlinear Mixed-Effects Model Development and Simulation Using nlmixr and Related R Open-Source Packages"
+author:
+  - Matthew Fidler, Novartis
+  - Justin J. Wilkins, Occams
+  - Richard Hooijmaijers, LAP\&P
+  - Teun M. Post, LAP&P
+  - Rik Schoemaker, Occams
+  - Mirjam Trame, Novartis
+  - Yuan Xiong, Certara
+  - Wenping Wang, Novartis
+  date: "`r Sys.Date()`"
+
+output:
+  md_document:
+    variant: markdown_github
+    toc: true
+    toc_depth: 3
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  message = FALSE,
+  warning = FALSE,
+  out.width = "100%"
+  )
+```
+
+This vignette includes an updated and simplified version of the code used for the tutorial published in_Clinical Pharmacology & Therapeutics: Pharmacometrics and Systems Pharmacology_ in 2019 [https://doi.org/10.1002/psp4.12445](https://doi.org/10.1002/psp4.12445). It includes a number of updates to keep the examples working with current versions of `nlmixr2` and `rxode2`. Workflow is, on the whole, not different, although some commands and parameters have changed. 
+
+```{r libraries}
+
+library(gridExtra)
+library(rxode2)
+library(MASS)
+library(data.table)
+library(ggplot2)
+library(nlmixr2)
+library(xpose)
+library(xpose.nlmixr2)
+library(tibble)
+
+```
+
+## Setting up the data 
+
+The first step is to simulate the data we will need to run the examples. For this tutorial, we'll use a two-compartmental PK model with some correlation between parameters, and covariate effects of body weight and sex. 
+
+```{r simulate_data, cache=T}
+mod <- rxode2({
+  k10 = CL/V2
+  k12 = Q/V2
+  k21 = Q/V3
+  d/dt(depot) =-KA*depot;
+  d/dt(centr) = KA*depot - k10*centr - k12*centr + k21*peri;
+  d/dt(peri)  =                        k12*centr - k21*peri;
+  C2 = centr/V2;
+  C3 = peri/V3;
+  cp = C2 
+})
+
+theta <- c(TKA=1.05, TCL=0.121, TV2=1.939,
+           TQ=0.282, TV3=5.65)
+
+omegaCor <- matrix(c(1,    0.5, 0.25, 0.1,  0,
+                     0.5,  1,   0.5,  0.1,  0,
+                     0.25, 0.5, 1,    0.1,  0,
+                     0.1,  0.1, 0.1,  1,    0,
+                     0,    0,   0,    0,    1), 
+                   dimnames=list(NULL,c("eta.CL",
+                                        "eta.V2",
+                                        "eta.V3", 
+                                        "eta.Q", 
+                                        "eta.KA")), nrow=5)
+
+iiv.sd <- c(0.25, 0.25, 0.25, 0.3, 0.3) ## SDs of model parameters
+
+iiv <- iiv.sd %*% t(iiv.sd)
+omega <- iiv * omegaCor  # covariance matrix
+
+sigma <- diag(1)*0.1
+dimnames(sigma) <- list(NULL, c("cp.err"))
+
+set.seed(740727)
+
+mv <- mvrnorm(40, rep(0, dim(omega)[1]), omega) # Sample from covariance matrix
+
+# Combine population parameters with IIV
+params.all <-
+  data.table(
+    "ID" = seq(1:40),
+    "CL" = theta['TCL'] * exp(mv[, 1]),
+    "V2" = theta['TV2'] * exp(mv[, 2]),
+    "V3" = theta['TV3'] * exp(mv[, 3]),
+    "Q"  = theta['TQ']  * exp(mv[, 4]),
+    "KA" = theta['TKA'] * exp(mv[, 5]),
+    "WT" = round(rnorm(40,70,15)),
+    "SEX" = rbinom(n = 40, prob = 0.5, size =1)
+  )
+#set the doses (looping through the 4 doses)
+params.all[, AMT := 1200]
+
+params.all$CL <- params.all$CL * (params.all$WT/70)^0.75
+params.all$V2 <- params.all$V2 * (1 - 0.2 * params.all$SEX)
+
+s = lapply(1:40, function(i) {
+  # selects the parameters associated with the subject to be simulated
+  params <- params.all[i]
+  # creates an eventTable with 7 doses every 24 hours
+  ev <- eventTable()
+  ev$add.dosing(
+    dose = params$AMT,
+    nbr.doses = 28,
+    dosing.to = 1,
+    dosing.interval = 24,
+    rate = NULL,
+    start.time = 0
+  )
+
+  smp <- c(round(runif(1, 0, 1),3),
+           round(runif(1, 1, 3),3),
+           round(runif(1, 3, 6), 3),
+           round(runif(1, 6, 12), 3),
+           round(runif(1, 18, 23.9), 3),
+           round(runif(1, 168, 169),3),
+           round(runif(1, 169, 171),3),
+           round(runif(1, 171, 180),3),
+           round(runif(1, 188, 191.9),3))
+
+  ev$add.sampling(smp)
+
+  x <- as.data.table(mod$run(params, ev, seed=740727))
+  x$rv <- rnorm(nrow(x), 0, 0.075)
+  x$DV <- round(x$cp * (1 + x$rv),1)
+  x$ID <- i
+
+  x[, names(params) := params]
+})
+
+sim <- as.data.table(do.call("rbind", s))
+
+setnames(sim, "time", "TIME")
+
+Dose <- expand.grid(TIME = seq(0, 7 * 24, 24), ID = params.all$ID, DV=0)
+Dose <- data.table(merge(Dose, params.all, by = "ID"))
+Dose[, EVID := 101]
+
+sim[, EVID := 0]
+sim[, AMT := 0]
+
+sim <- sim[,c("ID","TIME","DV","WT","SEX","AMT","EVID")]
+dat <- rbind(sim, Dose[,c("ID","TIME","DV","WT","SEX","AMT","EVID")])
+setkey(dat, ID, TIME)
+```
+
+Here's what the data look like, stratified by day.
+
+```{r plot, cache=T, fig.width=8, fig.height=5}
+dat$Day <- "Day 1"
+dat$Day[dat$TIME>167] <- "Day 8"
+
+ggplot(subset(data.frame(dat), EVID==0), aes(TIME, DV)) + geom_point(col="#1F4E79") +
+  geom_line(aes(group=ID), col="#1F4E79") +
+  scale_x_continuous("Time (h)") +
+  scale_y_log10("Concentration (mg/L)") +
+  facet_wrap(~ Day, scales="free_x")
+```
+
+
+## Model exploration
+
+### One-compartmental, using NLME
+
+We start our model exploration using a one-compartmental model, fitted using the NLME method. This is known to be terrible, but let's see just how terrible. We will request NPDE and CWRES by specifying `table=tableControl(cwres=TRUE, npde=TRUE)`. 
+
+```{r 1-cpt-nlme, cache=T}
+model.1cpt.cf <- function() {
+  ini({
+    tka <- log(1.5)
+    tcl <- log(1.5)
+    tv  <- log(3)
+    eta.ka ~ 0.1
+    eta.cl ~ 0.1
+    eta.v ~ 0.1
+    add.err <- 0.01
+  })
+  model({
+    ka <- exp(tka + eta.ka)
+    cl <- exp(tcl + eta.cl)
+    v <- exp(tv + eta.v)
+    linCmt() ~ add(add.err)
+  })
+}
+
+fit.1cpt.cf.nlme <- nlmixr2(model.1cpt.cf, dat, est="nlme", table=tableControl(cwres=TRUE, npde=TRUE))
+```
+
+We can see a snapshot of the results by using `print`.
+
+```{r 1-cpt-nlme-results, cache=T}
+print(fit.1cpt.cf.nlme)
+```
+
+Now let's fit the same model using SAEM, and ordinary differential equations (ODEs).
+
+```{r 1cpt-saem, cache=T}
+model.1cpt.ode <- function() {
+  ini({
+    tka <- log(1.5)
+    tcl <- log(1.5)
+    tv  <- log(3)
+    eta.ka ~ 1
+    eta.cl ~ 1
+    eta.v ~ 1
+    prop.err <- 0.1
+  })
+  model({
+    ka <- exp(tka + eta.ka)
+    cl <- exp(tcl + eta.cl)
+    v <- exp(tv + eta.v)
+    d/dt(depot) = -ka * depot
+    d/dt(center) = ka * depot - cl / v * center
+    cp = center / v
+    cp ~ prop(prop.err)
+  })
+}
+
+fit.1cpt.ode.saem <- nlmixr2(model.1cpt.ode, dat, est="saem", table=tableControl(cwres=TRUE, npde=TRUE), seed=740727)
+```
+
+The default for SAEM is to run 500 iterations. 
+
+```{r 1cpt-saem-results, cache=T}
+print(fit.1cpt.ode.saem)
+```
+
+From the output, we see the objective function - calculated using FOCEI - is **`r round(as.numeric(fit.1cpt.ode.saem$objDf[1]),3)`**. Let's look at some diagnostic plots.
+
+```{r 1cpt-diagnostics, cache=T, fig.width=8, fig.height=8}
+xp.1cpt.ode.saem <- xpose_data_nlmixr2(fit.1cpt.ode.saem, xp_theme = theme_xp_nlmixr2())
+
+xp1 <- dv_vs_pred(xp.1cpt.ode.saem, title = "DV vs PRED",
+                  subtitle = NULL, caption = NULL) +
+  coord_cartesian(ylim=c(0,1000), xlim=c(0,1000)) +
+  scale_x_continuous("Population predictions") +
+  scale_y_continuous("Observed concentrations")
+
+xp2 <- dv_vs_ipred(xp.1cpt.ode.saem, title = "DV vs IPRED",
+                   subtitle = NULL, caption = NULL) +
+  coord_cartesian(ylim=c(0,1000), xlim=c(0,1000))+
+  scale_x_continuous("Individual predictions") +
+  scale_y_continuous("Observed concentrations")
+
+xp3 <- res_vs_idv(xp.1cpt.ode.saem, res = "CWRES", title = "CWRES vs time",
+                  subtitle = NULL, caption = NULL) +
+  coord_cartesian(ylim=c(-3.5,3.5)) +
+  scale_x_continuous("Time (h)") +
+  scale_y_continuous("Conditional weighted residuals")
+
+xp4 <- res_vs_pred(xp.1cpt.ode.saem, res = "CWRES", title = "CWRES vs PRED",
+                   subtitle = NULL, caption = NULL)+
+  coord_cartesian(ylim=c(-3.5,3.5))+
+  scale_x_continuous("Population predictions") +
+  scale_y_continuous("Conditional weighted residuals")
+
+grid.arrange(xp1, xp2, xp3, xp4, nrow=2)
+```
+
+That's pretty horrible. What about a VPC? `nlmixr` makes VPCs quick and easy.
+
+```{r 1cpt-vpc, cache=T, fig.width=8, fig.height=5}
+bins <- c(0, 3, 12, 24, 168, 171, 180, 192)
+vpc.1cpt <- nlmixr2::vpcPlot(fit.1cpt.ode.saem, n=400,show=list(obs_dv=T),
+                        bins=bins);
+vpc.1cpt +
+    scale_x_continuous("Time (h)") +
+    scale_y_continuous("Concentration")
+```
+
+Still horrible. 
+
+We know that the true model is two-compartmental, because that's how we simulated it. Let's try that. 
+
+```{r 2cpt-saem, cache=T}
+model.2cpt.ode <- function() {
+  ini({
+    tka <- log(1.05)
+    tcl <- log(0.121)
+    tv2  <- log(1.939)
+    tv3  <- log(5.65)
+    tq   <- log(0.282)
+    eta.ka ~ 0.1
+    eta.cl ~ 0.1
+    eta.v2 ~ 0.1
+    eta.v3 ~ 0.1
+    eta.q ~ 0.1
+    add.err <- 75
+  })
+  model({
+    ka <- exp(tka + eta.ka)
+    cl <- exp(tcl + eta.cl)
+    v2 <- exp(tv2 + eta.v2)
+    v3 <- exp(tv3 + eta.v3)
+    q  <- exp(tq + eta.q)
+    d/dt(depot) = -ka * depot
+    d/dt(center) = ka * depot - cl / v2 * center + q/v3 * periph - q/v2 * center
+    d/dt(periph) = q/v2 * center - q/v3 * periph
+    cp = center / v2
+    cp ~ add(add.err)
+  })
+}
+
+fit.2cpt.ode.saem <- nlmixr2(model.2cpt.ode, dat, est="saem", table=tableControl(cwres=TRUE, npde=TRUE), seed=740727)
+```
+
+```{r 2cpt-saem-results, cache=T}
+print(fit.2cpt.ode.saem)
+```
+
+We have reduced the OFV from **`r round(as.numeric(fit.1cpt.ode.saem$objDf[1]),3)`** to **`r round(as.numeric(fit.2cpt.ode.saem$objDf[1]),3)`**, a drop of **`r round(as.numeric(fit.1cpt.ode.saem$objDf[1])-as.numeric(fit.2cpt.ode.saem$objDf[1]),3)`**! Progress. 
+
+What about the residual error? We're using an additive model. What happens when we try proportional?
+
+```{r 2cpt-saem-prop, cache=T}
+model.2cptp.ode <- function() {
+  ini({
+    tka <- log(1.05)
+    tcl <- log(0.121)
+    tv2  <- log(1.939)
+    tv3  <- log(5.65)
+    tq   <- log(0.282)
+    eta.ka ~ 0.1
+    eta.cl ~ 0.1
+    eta.v2 ~ 0.1
+    eta.v3 ~ 0.1
+    eta.q ~ 0.1
+    prop.err <- 0.075
+  })
+  model({
+    ka <- exp(tka + eta.ka)
+    cl <- exp(tcl + eta.cl)
+    v2 <- exp(tv2 + eta.v2)
+    v3 <- exp(tv3 + eta.v3)
+    q  <- exp(tq + eta.q)
+    d/dt(depot) = -ka * depot
+    d/dt(center) = ka * depot - cl / v2 * center + q/v3 * periph - q/v2 * center
+    d/dt(periph) = q/v2 * center - q/v3 * periph
+    cp = center / v2
+    cp ~ prop(prop.err)
+  })
+}
+
+fit.2cptp.ode.saem <- nlmixr2(model.2cptp.ode, dat, est="saem", table=tableControl(cwres=TRUE, npde=TRUE), seed=740727)
+```
+
+```{r 2cpt-saem-prop-results, cache=T}
+print(fit.2cptp.ode.saem)
+```
+
+A further drop of **`r round(as.numeric(fit.2cpt.ode.saem$objDf[1])-as.numeric(fit.2cptp.ode.saem$objDf[1]),3)`** points!
+
+```{r 2cpt-diagnostics, cache=T, fig.width=8, fig.height=8}
+xp.2cpt.ode.saem <- xpose_data_nlmixr2(fit.2cptp.ode.saem, xp_theme = theme_xp_nlmixr2())
+
+xp1 <- dv_vs_pred(xp.2cpt.ode.saem, title = "DV vs PRED",
+                  subtitle = NULL, caption = NULL) +
+  coord_cartesian(ylim=c(0,1000), xlim=c(0,1000)) +
+  scale_x_continuous("Population predictions") +
+  scale_y_continuous("Observed concentrations")
+
+xp2 <- dv_vs_ipred(xp.2cpt.ode.saem, title = "DV vs IPRED",
+                   subtitle = NULL, caption = NULL) +
+  coord_cartesian(ylim=c(0,1000), xlim=c(0,1000))+
+  scale_x_continuous("Individual predictions") +
+  scale_y_continuous("Observed concentrations")
+
+xp3 <- res_vs_idv(xp.2cpt.ode.saem, res = "CWRES", title = "CWRES vs time",
+                  subtitle = NULL, caption = NULL) +
+  coord_cartesian(ylim=c(-3.5,3.5)) +
+  scale_x_continuous("Time (h)") +
+  scale_y_continuous("Conditional weighted residuals")
+
+xp4 <- res_vs_pred(xp.2cpt.ode.saem, res = "CWRES", title = "CWRES vs PRED",
+                   subtitle = NULL, caption = NULL)+
+  coord_cartesian(ylim=c(-3.5,3.5))+
+  scale_x_continuous("Population predictions") +
+  scale_y_continuous("Conditional weighted residuals")
+
+grid.arrange(xp1, xp2, xp3, xp4, nrow=2)
+```
+
+Better.
+
+```{r 2cpt-vpc, cache=T, fig.width=8, fig.height=5}
+bins <- c(0, 3, 12, 24, 168, 171, 180, 192)
+vpc.2cpt <- nlmixr2::vpcPlot(fit.2cptp.ode.saem, n=400,show=list(obs_dv=T),
+                        bins=bins);
+vpc.2cpt +
+    scale_x_continuous("Time (h)") +
+    scale_y_continuous("Concentration")
+```
+
+Much better!
+
+<!-- For good measure, what does a 3-compartmental model look like? -->
+
+<!-- ```{r 3cpt-saem, cache=T} -->
+<!-- model.3cpt.ode <- function() { -->
+<!--   ini({ -->
+<!--     tka <- log(1.42) -->
+<!--     tcl <- log(0.044) -->
+<!--     tv2  <- log(2) -->
+<!--     tv3  <- log(10) -->
+<!--     tv4  <- log(10) -->
+<!--     tq2   <- log(0.5) -->
+<!--     tq3   <- log(0.5) -->
+<!--     eta.ka ~ 0.1 -->
+<!--     eta.cl ~ 0.1 -->
+<!--     eta.v2 ~ 0.1 -->
+<!--     eta.v3 ~ 0.1 -->
+<!--     eta.v4 ~ 0.1 -->
+<!--     eta.q2 ~ 0.1 -->
+<!--     eta.q3 ~ 0.1 -->
+<!--     prop.err <- 0.075 -->
+<!--   }) -->
+<!--   model({ -->
+<!--     ka <- exp(tka + eta.ka) -->
+<!--     cl <- exp(tcl + eta.cl) -->
+<!--     v2 <- exp(tv2 + eta.v2) -->
+<!--     v3 <- exp(tv3 + eta.v3) -->
+<!--     v4 <- exp(tv4 + eta.v4) -->
+<!--     q2  <- exp(tq2 + eta.q2) -->
+<!--     q3  <- exp(tq3 + eta.q3) -->
+<!--     d/dt(depot) = -ka * depot -->
+<!--     d/dt(center) = ka * depot - cl / v2 * center + q2/v3 * periph1 - q2/v2 * center + q3/v4 * periph2 - q3/v2 * center -->
+<!--     d/dt(periph1) = q2/v2 * center - q2/v3 * periph1 -->
+<!--     d/dt(periph2) = q3/v2 * center - q3/v4 * periph2 -->
+<!--     cp = center / v2 -->
+<!--     cp ~ prop(prop.err) -->
+<!--   }) -->
+<!-- } -->
+
+<!-- fit.3cpt.ode.saem <- nlmixr2(model.3cpt.ode, dat, est="saem", table=tableControl(cwres=TRUE, npde=TRUE), seed=740727) -->
+<!-- ``` -->
+
+<!-- ```{r 3cpt-saem-prop-results, cache=T} -->
+<!-- print(fit.3cpt.ode.saem) -->
+<!-- ``` -->
+
+<!-- Looks better, doesn't it? Although we know it's not true. Let's tabulate the results so far. -->
+
+<!-- ```{r modcmp1, cache=T} -->
+<!-- otab <- data.frame(Model = c(1, 2, 3, 4), -->
+<!--                    RelativeTo = c("-", 1, 2, 3), -->
+<!--                    Description = c("1-cpt, additive residual error", -->
+<!--                              "2-cpt, additive residual error", -->
+<!--                              "2-cpt, proportional residual error", -->
+<!--                              "3-cpt, proportional residual error"), -->
+<!--                    OFV = c(fit.1cpt.ode.saem$value, fit.2cpt.ode.saem$value, fit.2cptp.ode.saem$value, fit.3cpt.ode.saem$value), -->
+<!--                    dOFV = round(c(0, fit.2cpt.ode.saem$value-fit.1cpt.ode.saem$value, -->
+<!--                             fit.2cptp.ode.saem$value-fit.2cpt.ode.saem$value, fit.3cpt.ode.saem$value-fit.2cptp.ode.saem$value),3), -->
+<!--                    AIC = c(AIC(fit.1cpt.ode.saem), AIC(fit.2cpt.ode.saem), AIC(fit.2cptp.ode.saem), AIC(fit.3cpt.ode.saem)), -->
+<!--                    dAIC = round(c(0, AIC(fit.2cpt.ode.saem)-AIC(fit.1cpt.ode.saem), -->
+<!--                             AIC(fit.2cptp.ode.saem)-AIC(fit.2cpt.ode.saem), AIC(fit.3cpt.ode.saem)-AIC(fit.2cptp.ode.saem)),3), -->
+<!--                    BIC = c(BIC(fit.1cpt.ode.saem), BIC(fit.2cpt.ode.saem), BIC(fit.2cptp.ode.saem), BIC(fit.3cpt.ode.saem)), -->
+<!--                    dBIC = round(c(0, BIC(fit.2cpt.ode.saem)-BIC(fit.1cpt.ode.saem), -->
+<!--                             BIC(fit.2cptp.ode.saem)-BIC(fit.2cpt.ode.saem), BIC(fit.3cpt.ode.saem)-BIC(fit.2cptp.ode.saem)),3)) -->
+
+<!-- knitr::kable( -->
+<!--   otab, longtable = TRUE, booktabs = TRUE) -->
+<!-- ``` -->
+
+<!-- For every metric except BIC, the 3-compartment model looks better, although we know it is not the correct model. Let's run with the 2-compartment model for now.  -->
+
+## Covariates
+
+Now let's try some covariates! We know weight and sex are important, since we had them in the simulation model. Weight first...
+
+```{r 2cptwt, cache=T}
+dat$lnWT <- log(dat$WT/70)
+
+model.2cpt.ode.wtcl <- function() {
+  ini({
+    tka <- log(1.05)
+    tcl <- log(0.121)
+    tv2  <- log(1.939)
+    tv3  <- log(5.65)
+    tq   <- log(0.282)
+    wteff <- 0.75
+    eta.ka ~ 0.2
+    eta.cl ~ 0.2
+    eta.v2 ~ 0.2
+    eta.v3 ~ 0.2
+    eta.q ~ 0.2
+    prop.err <- 0.075
+  })
+  model({
+    ka = exp(tka + eta.ka)
+    cl = exp(tcl + wteff*lnWT + eta.cl)
+    v2 = exp(tv2 + eta.v2)
+    v3 = exp(tv3 + eta.v3)
+    q  = exp(tq + eta.q)
+    d/dt(depot) = -ka * depot
+    d/dt(center) = ka * depot - cl / v2 * center + q/v3 * periph - q/v2 * center
+    d/dt(periph) = q/v2 * center - q/v3 * periph
+    cp = center / v2
+    cp ~ prop(prop.err)
+  })
+}
+
+fit.2cpt.ode.wtcl.saem <- nlmixr2(model.2cpt.ode.wtcl, dat, est="saem", table=tableControl(cwres=TRUE, npde=TRUE))
+```
+
+```{r 2cptsex, cache=T}
+model.2cpt.ode.sexv2 <- function() {
+  ini({
+    tka <- log(1.15)
+    tcl <- log(0.12)
+    tv2  <- log(1.82)
+    tv3  <- log(5.73)
+    tq   <- log(0.278)
+    sexeff <- -0.01
+    eta.ka ~ 0.06626505
+    eta.cl ~ 0.09320262
+    eta.v2 ~ 0.05237126
+    eta.v3 ~ 0.008968923
+    eta.q ~ 0.08214272
+    prop.err <- 0.075
+  })
+  model({
+    ka = exp(tka + eta.ka)
+    cl = exp(tcl + eta.cl)
+    v2 = exp(tv2 + sexeff*(SEX) + eta.v2)
+    v3 = exp(tv3 + eta.v3)
+    q  = exp(tq + eta.q)
+    d/dt(depot) = -ka * depot
+    d/dt(center) = ka * depot - cl / v2 * center + q/v3 * periph - q/v2 * center
+    d/dt(periph) = q/v2 * center - q/v3 * periph
+    cp = center / v2
+    cp ~ prop(prop.err)
+  })
+}
+
+fit.2cpt.ode.sexv2.saem <- nlmixr2(model.2cpt.ode.sexv2, dat, est="saem", table=tableControl(cwres=TRUE, npde=TRUE))
+```
+
+```{r 2cptwtsex, cache=T}
+model.2cpt.ode.wtcl.sexv2 <- function() {
+  ini({
+    tka <- log(1.05)
+    tcl <- log(0.121)
+    tv2  <- log(1.939)
+    tv3  <- log(5.65)
+    tq   <- log(0.282)
+    wteff  <- 0.75
+    sexeff <- -0.2
+    eta.ka ~ 0.06626505
+    eta.cl ~ 0.09320262
+    eta.v2 ~ 0.05237126
+    eta.v3 ~ 0.008968923
+    eta.q ~ 0.08214272
+    prop.err <- 0.075
+  })
+  model({
+    ka <- exp(tka + eta.ka)
+    cl <- exp(tcl + wteff*lnWT + eta.cl)
+    v2 <- exp(tv2 + sexeff*(SEX) + eta.v2)
+    v3 <- exp(tv3 + eta.v3)
+    q  <- exp(tq + eta.q)
+    d/dt(depot) = -ka * depot
+    d/dt(center) = ka * depot - cl / v2 * center + q/v3 * periph - q/v2 * center
+    d/dt(periph) = q/v2 * center - q/v3 * periph
+    cp = center / v2
+    cp ~ prop(prop.err)
+  })
+}
+
+## broke.
+fit.2cpt.ode.wtcl.sexv2.saem <- nlmixr2(model.2cpt.ode.wtcl.sexv2, dat, est="saem", table=tableControl(cwres=TRUE, npde=TRUE))
+```
+
+Time to tabulate again...
+
+```{r covtab, cache=T}
+otab <- data.frame(Model = c(1, 2, 3, 4, 5, 6, 7),
+                   RelativeTo = c("-", 1, 2, 3, 3, 3, 5),
+                   Description = c("1-cpt, add residual error",
+                             "2-cpt, add residual error",
+                             "2-cpt, prop residual error (base)",
+                             "3-cpt, prop residual error",
+                             "Base with WT-CL",
+                             "Base with SEX-V2",
+                             "Base with WT-CL, SEX-V2 (final)"),
+                   OFV = c(fit.1cpt.ode.saem$value, fit.2cpt.ode.saem$value, fit.2cptp.ode.saem$value, fit.3cpt.ode.saem$value,
+                           fit.2cpt.ode.wtcl.saem$value, fit.2cpt.ode.sexv2.saem$value, fit.2cpt.ode.wtcl.sexv2.saem$value),
+                   dOFV = round(c(0,
+                                  fit.2cpt.ode.saem$value-fit.1cpt.ode.saem$value,
+                                  fit.2cptp.ode.saem$value-fit.2cpt.ode.saem$value,
+                                  fit.3cpt.ode.saem$value-fit.2cptp.ode.saem$value,
+                                  fit.2cpt.ode.wtcl.saem$value-fit.2cptp.ode.saem$value,
+                                  fit.2cpt.ode.sexv2.saem$value-fit.2cptp.ode.saem$value,
+                                  fit.2cpt.ode.wtcl.sexv2.saem$value-fit.2cpt.ode.wtcl.saem$value),3),
+                   AIC = c(AIC(fit.1cpt.ode.saem), AIC(fit.2cpt.ode.saem), AIC(fit.2cptp.ode.saem), AIC(fit.3cpt.ode.saem),
+                           AIC(fit.2cpt.ode.wtcl.saem), AIC(fit.2cpt.ode.sexv2.saem), AIC(fit.2cpt.ode.wtcl.sexv2.saem)),
+                   dAIC = round(c(0,
+                                  AIC(fit.2cpt.ode.saem)-AIC(fit.1cpt.ode.saem),
+                                  AIC(fit.2cptp.ode.saem)-AIC(fit.2cpt.ode.saem),
+                                  AIC(fit.3cpt.ode.saem)-AIC(fit.2cptp.ode.saem),
+                                  AIC(fit.2cpt.ode.wtcl.saem)-AIC(fit.2cptp.ode.saem),
+                                  AIC(fit.2cpt.ode.sexv2.saem)-AIC(fit.2cptp.ode.saem),
+                                  AIC(fit.2cpt.ode.wtcl.sexv2.saem)-AIC(fit.2cpt.ode.wtcl.saem)),3),
+                   BIC = c(BIC(fit.1cpt.ode.saem), BIC(fit.2cpt.ode.saem), BIC(fit.2cptp.ode.saem), BIC(fit.3cpt.ode.saem),
+                           BIC(fit.2cpt.ode.wtcl.saem), BIC(fit.2cpt.ode.sexv2.saem), BIC(fit.2cpt.ode.wtcl.sexv2.saem)),
+                   dBIC = round(c(0,
+                                  BIC(fit.2cpt.ode.saem)-BIC(fit.1cpt.ode.saem),
+                                  BIC(fit.2cptp.ode.saem)-BIC(fit.2cpt.ode.saem),
+                                  BIC(fit.3cpt.ode.saem)-BIC(fit.2cptp.ode.saem),
+                                  BIC(fit.2cpt.ode.wtcl.saem)-BIC(fit.2cptp.ode.saem),
+                                  BIC(fit.2cpt.ode.sexv2.saem)-BIC(fit.2cptp.ode.saem),
+                                  BIC(fit.2cpt.ode.wtcl.sexv2.saem)-BIC(fit.2cpt.ode.wtcl.saem)),3))
+
+knitr::kable(
+  otab, longtable = TRUE, booktabs = TRUE)
+```
+
+As we can see, the model with both weight and sex fits the best...
+
+```{r 2cpt-cov-diagnostics, cache=T, fig.width=8, fig.height=8}
+xp.2cpt.cov.ode.saem <- xpose_data_nlmixr2(fit.2cpt.ode.wtcl.sexv2.saem, xp_theme = theme_xp_nlmixr2())
+
+xp1 <- dv_vs_pred(xp.2cpt.cov.ode.saem, title = "DV vs PRED",
+                  subtitle = NULL, caption = NULL) +
+  coord_cartesian(ylim=c(0,1000), xlim=c(0,1000)) +
+  scale_x_continuous("Population predictions") +
+  scale_y_continuous("Observed concentrations")
+
+xp2 <- dv_vs_ipred(xp.2cpt.cov.ode.saem, title = "DV vs IPRED",
+                   subtitle = NULL, caption = NULL) +
+  coord_cartesian(ylim=c(0,1000), xlim=c(0,1000))+
+  scale_x_continuous("Individual predictions") +
+  scale_y_continuous("Observed concentrations")
+
+xp3 <- res_vs_idv(xp.2cpt.cov.ode.saem, res = "CWRES", title = "CWRES vs time",
+                  subtitle = NULL, caption = NULL) +
+  coord_cartesian(ylim=c(-3.5,3.5)) +
+  scale_x_continuous("Time (h)") +
+  scale_y_continuous("Conditional weighted residuals")
+
+xp4 <- res_vs_pred(xp.2cpt.cov.ode.saem, res = "CWRES", title = "CWRES vs PRED",
+                   subtitle = NULL, caption = NULL)+
+  coord_cartesian(ylim=c(-3.5,3.5))+
+  scale_x_continuous("Population predictions") +
+  scale_y_continuous("Conditional weighted residuals")
+
+grid.arrange(xp1, xp2, xp3, xp4, nrow=2)
+```
+
+```{r 2cpt-cov-vpc, cache=T, fig.width=8, fig.height=5}
+bins <- c(0, 3, 12, 24, 168, 171, 180, 192)
+vpc.2cpt.cov <- nlmixr2::vpcPlot(fit.2cpt.ode.wtcl.sexv2.saem, n=400,show=list(obs_dv=T),
+                        bins=bins);
+vpc.2cpt.cov +
+    scale_x_continuous("Time (h)") +
+    scale_y_continuous("Concentration")
+```
+
+And we get the following set of parameter estimates -
+
+```{r partab, cache=T}
+knitr::kable(
+  fit.2cpt.ode.wtcl.sexv2.saem$parFixed, longtable = TRUE, booktabs = TRUE)
+```
+
+Not every parameter is spot on, but we haven't done too badly in recovering what we used for simulation.
+
+## Simulations
+
+We can use our model as a basis for simulation, by feeding it back into `rxode2`!
+
+```{r simdes, cache=T}
+ev <- eventTable(amount.units="mg", time.units="hours") %>%
+    add.dosing(dose=600, nbr.doses=10, dosing.interval=24) %>%
+    add.dosing(dose=2000, nbr.doses=5,
+               start.time=240,dosing.interval=48) %>%
+    add.sampling(0:480);
+```
+
+```{r sim1, cache=T}
+sim.2cpt <- rxSolve(fit.2cpt.ode.saem, events=ev, nSub=500)
+
+length(unique(sim.2cpt$sim.id))
+head(sim.2cpt)
+
+ssim <- as_tibble(sim.2cpt) %>%
+  group_by(time) %>%
+  dplyr::summarise(
+    med = quantile(cp, 0.5),
+    q025 = quantile(cp, 0.025),
+    q05 = quantile(cp, 0.25),
+    q25 = quantile(cp, 0.5),
+    q75 = quantile(cp, 0.75),
+    q95 = quantile(cp, 0.95),
+    q975 = quantile(cp, 0.975)
+  ) 
+```
+
+```{r sim1plot, cache=T, fig.height=5, fig.width=8}
+ggplot(units::drop_units(ssim), aes(time, med)) +
+  geom_ribbon(aes(time, ymax=q975, ymin=q025), fill="red", alpha=0.1) +
+  geom_ribbon(aes(time, ymax=q95, ymin=q05), fill="red", alpha=0.1) +
+  geom_ribbon(aes(time, ymax=q75, ymin=q25), fill="red", alpha=0.1) +
+  geom_line(col="red") +
+  scale_x_continuous("Time") +
+  scale_y_continuous("Concentration")
+  
+```
+
+
