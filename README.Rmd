@@ -27,7 +27,8 @@ knitr::opts_chunk$set(
   comment = "#>",
   message = FALSE,
   warning = FALSE,
-  out.width = "100%"
+  out.width = "100%",
+  fig.path = "figure/README-"
   )
 ```
 
